@@ -6,9 +6,9 @@ buildscript {
             // Jackson 2.x on the *plugin* classpath (gradle-node-plugin, cyclonedx-gradle-plugin).
             // The runtime pin in the subprojects eachDependency table does not reach this
             // configuration, and the dependency graph submitted to GitHub includes it.
-            // CVE fix: GHSA-r7wm-3cxj-wff9, GHSA-5gvw-p9qm-jgwh, GHSA-5jmj-h7xm-6q6v
-            force 'com.fasterxml.jackson.core:jackson-core:2.22.2'
-            force 'com.fasterxml.jackson.core:jackson-databind:2.22.2'
+            // CVE fix: GHSA-r7wm-3cxj-wff9, GHSA-5gvw-p9qm-jgwh, GHSA-5jmj-h7xm-6q6v, GHSA-cxp5-3px4-pw24, GHSA-wv8q-qhhj-9h54
+            force 'com.fasterxml.jackson.core:jackson-core:2.22.3'
+            force 'com.fasterxml.jackson.core:jackson-databind:2.22.3'
         }
     }
 }
@@ -48,7 +48,7 @@ ext {
     mongoVersion = '5.12.0'
 
     // Jackson
-    jacksonBomVersion = '3.2.2'
+    jacksonBomVersion = '3.2.3'
 
     // GraphQL (SCM API proxy — parses GraphQL request bodies for AST-based mutation allowlisting)
     graphqlJavaVersion = '26.1'
@@ -184,8 +184,8 @@ subprojects {
             // Jackson 3.x line (group tools.jackson), untouched here. Only these two artifacts get 2.22.1
             // patch releases — sibling modules (annotations, dataformats) stay on 2.22.0 and are compatible.
             if (r.group == 'com.fasterxml.jackson.core' && r.name in ['jackson-core', 'jackson-databind']) {
-                details.useVersion '2.22.1'
-                details.because 'CVE fix: GHSA-r7wm-3cxj-wff9, GHSA-5gvw-p9qm-jgwh, GHSA-5jmj-h7xm-6q6v'
+                details.useVersion '2.22.3'
+                details.because 'CVE fix: GHSA-r7wm-3cxj-wff9, GHSA-5gvw-p9qm-jgwh, GHSA-5jmj-h7xm-6q6v, GHSA-cxp5-3px4-pw24, GHSA-wv8q-qhhj-9h54'
             }
         }
     }
