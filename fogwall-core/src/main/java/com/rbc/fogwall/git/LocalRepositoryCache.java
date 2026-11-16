@@ -16,15 +16,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.TransportConfigCallback;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.errors.RepositoryNotFoundException;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.RefDatabase;
 import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.lib.RepositoryCache;
 import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.URIish;
+import org.eclipse.jgit.util.FS;
 import org.eclipse.jgit.util.FileUtils;
 
 /**
@@ -43,6 +47,10 @@ import org.eclipse.jgit.util.FileUtils;
  * ({@code CachedRepository.fetchLock}), so two {@code git fetch} operations never write the same bare repo at once. A
  * {@code fetchCooldownMs} guard additionally skips a re-fetch when the mirror was refreshed recently, avoiding
  * redundant network round-trips.
+ *
+ * <p><b>Removal</b> of a mirror takes the same per-key clone lock and then the entry's fetch lock, so a mirror is never
+ * deleted while a clone or fetch of it is writing to the directory. A fetch that was waiting on the lock when the entry
+ * was removed sees it as removed and falls back to a fresh clone rather than opening a deleted directory.
  *
  * <h3>Serve vs. fetch: intentionally lock-free</h3>
  *
@@ -84,6 +92,9 @@ public class LocalRepositoryCache {
      * principal — an unauthenticated caller only ever shares a cooldown with other unauthenticated callers.
      */
     private static final String ANONYMOUS_PRINCIPAL = "anonymous";
+
+    /** Shape of every key {@link #getCacheKey(String)} produces: a single path segment with no separators. */
+    private static final Pattern CACHE_KEY = Pattern.compile("[A-Za-z0-9._-]+");
 
     private final Path cacheDirectory;
     private final Map<String, CachedRepository> cache = new ConcurrentHashMap<>();
@@ -253,9 +264,11 @@ public class LocalRepositoryCache {
         CachedRepository cached = cache.get(cacheKey);
         if (cached != null && cached.isValid()) {
             log.debug("Using cached repository for: {}", remoteUrl);
-            refreshIfStale(cached, cacheKey, credentials, transportConfig, principalKey);
-            cached.repository.incrementOpen();
-            return cached.repository;
+            if (refreshIfStale(cached, cacheKey, credentials, transportConfig, principalKey)) {
+                cached.repository.incrementOpen();
+                return cached.repository;
+            }
+            log.debug("Cached repository for {} was removed while waiting to refresh; cloning again", remoteUrl);
         }
 
         log.info("Cloning repository from: {}", remoteUrl);
@@ -292,6 +305,9 @@ public class LocalRepositoryCache {
         }
         cached.fetchLock.lock();
         try {
+            if (cached.removed) {
+                return false;
+            }
             log.info("Forcing upstream refresh for {} (cooldown bypassed, deepening to full history)", cacheKey);
             try (Git git = Git.open(new File(cacheDirectory.toFile(), cacheKey))) {
                 var fetch = git.fetch()
@@ -342,8 +358,11 @@ public class LocalRepositoryCache {
      * repository serialize — the second caller will see the updated {@code lastFetchedAt} and skip the fetch. This
      * prevents two simultaneous JGit fetch operations against the same bare repository directory, which can corrupt
      * ref/pack state under concurrent access.
+     *
+     * @return {@code false} if the entry was removed while this caller waited for the lock, in which case its directory
+     *     is gone and the caller must clone again; {@code true} otherwise
      */
-    private void refreshIfStale(
+    private boolean refreshIfStale(
             CachedRepository cached,
             String cacheKey,
             CredentialsProvider credentials,
@@ -352,6 +371,9 @@ public class LocalRepositoryCache {
             throws GitAPIException, IOException {
         cached.fetchLock.lock();
         try {
+            if (cached.removed) {
+                return false;
+            }
             cached.purgeExpiredPrincipals(fetchCooldownMs);
             Long lastFetched = cached.lastFetchedByPrincipal.get(principalKey);
             if (lastFetched != null && System.currentTimeMillis() - lastFetched <= fetchCooldownMs) {
@@ -359,7 +381,7 @@ public class LocalRepositoryCache {
                         "Skipping re-fetch for {} — this principal refreshed the mirror {}ms ago",
                         cacheKey,
                         System.currentTimeMillis() - lastFetched);
-                return;
+                return true;
             }
             log.debug(
                     "Re-fetching upstream for cached repository: {} — principal not verified within cooldown",
@@ -378,6 +400,7 @@ public class LocalRepositoryCache {
             long now = System.currentTimeMillis();
             cached.lastFetchedByPrincipal.put(principalKey, now);
             cached.lastSuccessfulFetchAt = now;
+            return true;
         } finally {
             cached.fetchLock.unlock();
         }
@@ -407,11 +430,12 @@ public class LocalRepositoryCache {
 
             File repoDir = new File(cacheDirectory.toFile(), cacheKey);
 
+            Git existing = repoDir.exists() ? openOrDiscard(repoDir) : null;
+
             Repository repository;
-            if (repoDir.exists()) {
+            if (existing != null) {
                 log.debug("Repository directory exists, opening and fetching: {}", repoDir);
-                Git git = Git.open(repoDir);
-                var fetchCmd = git.fetch().setRemote("origin");
+                var fetchCmd = existing.fetch().setRemote("origin");
                 if (credentials != null) fetchCmd.setCredentialsProvider(credentials);
                 if (transportConfig != null) fetchCmd.setTransportConfigCallback(transportConfig);
                 if (shallowSince != null) {
@@ -419,8 +443,13 @@ public class LocalRepositoryCache {
                 } else if (cloneDepth > 0) {
                     fetchCmd.setDepth(cloneDepth);
                 }
-                fetchCmd.call();
-                repository = git.getRepository();
+                try {
+                    fetchCmd.call();
+                } catch (GitAPIException | RuntimeException e) {
+                    existing.close();
+                    throw e;
+                }
+                repository = existing.getRepository();
             } else {
                 log.debug("Cloning repository to: {} ({})", repoDir, describeShallow());
                 var cloneCommand = Git.cloneRepository()
@@ -451,6 +480,31 @@ public class LocalRepositoryCache {
     }
 
     /**
+     * Opens an existing mirror directory. A directory that is not a usable mirror — not a git repository, or one with
+     * no {@code origin} remote, as an interrupted clone or a removal that raced one leaves behind — is deleted so the
+     * caller clones fresh, rather than failing every request for that repository until the process restarts.
+     *
+     * @return the opened repository, or {@code null} if the directory was not a usable mirror and has been deleted
+     */
+    private Git openOrDiscard(File repoDir) throws IOException {
+        if (RepositoryCache.FileKey.isGitRepository(repoDir, FS.DETECTED)) {
+            try {
+                Git git = Git.open(repoDir);
+                String origin = git.getRepository().getConfig().getString("remote", "origin", "url");
+                if (origin != null && !origin.isBlank()) {
+                    return git;
+                }
+                git.close();
+            } catch (RepositoryNotFoundException e) {
+                // fall through to discard
+            }
+        }
+        log.warn("Mirror directory {} is not a usable git mirror; deleting it and cloning again", repoDir);
+        deleteDirectory(repoDir.toPath());
+        return null;
+    }
+
+    /**
      * Get a repository from cache without cloning if it doesn't exist.
      *
      * @param remoteUrl The URL of the remote repository
@@ -476,22 +530,45 @@ public class LocalRepositoryCache {
      * Remove a single mirror by its cache key (the stable identifier surfaced by {@link #listEntries()}), deleting its
      * local clone from disk but leaving the cache root directory intact so subsequent clones still work.
      *
+     * <p>The mirror directory is deleted even when no entry is held for the key, so a directory orphaned by a failed
+     * clone is cleared too. Removal waits for any clone or fetch of the same repository to finish first.
+     *
      * @param cacheKey the cache key, as produced by {@link #getCacheKey(String)} and reported in
      *     {@link CacheEntrySummary#cacheKey()}
-     * @return {@code true} if an entry was present and removed, {@code false} if no entry matched the key
+     * @return {@code true} if an entry or a mirror directory was removed, {@code false} if neither existed or the key
+     *     is not a well-formed cache key
      * @throws IOException If deletion fails
      */
     public boolean removeByKey(String cacheKey) throws IOException {
-        CachedRepository cached = cache.remove(cacheKey);
-        if (cached == null) {
+        // The key reaches here from the admin API; anything that is not a single plain path segment could name a
+        // directory outside the cache root, and it is never a key this cache produced.
+        if (cacheKey == null
+                || !CACHE_KEY.matcher(cacheKey).matches()
+                || cacheKey.equals(".")
+                || cacheKey.equals("..")) {
+            log.warn("Refusing to remove malformed mirror cache key: {}", cacheKey);
             return false;
         }
-        cached.close();
-        File repoDir = cached.repository.getDirectory();
-        if (repoDir.exists()) {
-            deleteDirectory(repoDir.toPath());
+        ReentrantLock cloneLock = cloneLocks.computeIfAbsent(cacheKey, k -> new ReentrantLock());
+        cloneLock.lock();
+        try {
+            CachedRepository cached = cache.remove(cacheKey);
+            if (cached != null) {
+                cached.fetchLock.lock();
+                try {
+                    cached.removed = true;
+                    cached.close();
+                } finally {
+                    cached.fetchLock.unlock();
+                }
+            }
+            Path repoDir = cacheDirectory.resolve(cacheKey);
+            boolean dirExisted = Files.exists(repoDir);
+            deleteDirectory(repoDir);
+            return cached != null || dirExisted;
+        } finally {
+            cloneLock.unlock();
         }
-        return true;
     }
 
     /**
@@ -779,6 +856,12 @@ public class LocalRepositoryCache {
          */
         volatile long lastSuccessfulFetchAt;
 
+        /**
+         * Set under {@link #fetchLock} when the entry is removed from the cache, so a fetch that was waiting on the
+         * lock does not open the deleted directory.
+         */
+        volatile boolean removed = false;
+
         CachedRepository(Repository repository, String remoteUrl) {
             this.repository = repository;
             this.remoteUrl = remoteUrl;
@@ -793,7 +876,7 @@ public class LocalRepositoryCache {
         }
 
         boolean isValid() {
-            return repository != null && repository.getDirectory().exists();
+            return !removed && repository != null && repository.getDirectory().exists();
         }
 
         void close() {

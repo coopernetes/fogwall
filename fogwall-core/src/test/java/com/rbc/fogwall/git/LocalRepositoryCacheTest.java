@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -524,6 +525,117 @@ class LocalRepositoryCacheTest {
                 assertEquals(1, mirrorDirs, "Exactly one mirror must be cloned despite the concurrent first access");
             }
         } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void existingNonRepositoryDirectory_isDeletedAndClonedAgain() throws Exception {
+        LocalRepositoryCache cache = new LocalRepositoryCache(cacheTempDir, false);
+        Path leftover = cacheTempDir.resolve(cache.getCacheKey(remoteUrl));
+        Files.createDirectories(leftover.resolve("objects"));
+        Files.writeString(leftover.resolve("partial"), "left behind by an interrupted clone");
+
+        Repository repo = cache.getOrClone(remoteUrl);
+        try {
+            assertNotNull(repo.resolve("HEAD"), "The leftover directory is replaced by a working clone");
+            assertFalse(Files.exists(leftover.resolve("partial")), "The leftover contents are gone");
+        } finally {
+            repo.close();
+        }
+    }
+
+    @Test
+    void existingRepositoryWithoutOrigin_isDeletedAndClonedAgain() throws Exception {
+        LocalRepositoryCache cache = new LocalRepositoryCache(cacheTempDir, false);
+        Path leftover = cacheTempDir.resolve(cache.getCacheKey(remoteUrl));
+        // What a clone interrupted between initialising the repository and configuring its remote leaves behind.
+        Git.init().setBare(true).setDirectory(leftover.toFile()).call().close();
+
+        Repository repo = cache.getOrClone(remoteUrl);
+        try {
+            assertNotNull(repo.resolve("HEAD"), "The leftover repository is replaced by a working clone");
+        } finally {
+            repo.close();
+        }
+    }
+
+    @Test
+    void removeByKey_deletesAnOrphanedDirectoryWithNoEntry() throws Exception {
+        LocalRepositoryCache cache = new LocalRepositoryCache(cacheTempDir, false);
+        String key = cache.getCacheKey(remoteUrl);
+        Path orphan = cacheTempDir.resolve(key);
+        Files.createDirectories(orphan);
+        Files.writeString(orphan.resolve("partial"), "x");
+
+        assertTrue(cache.removeByKey(key), "Removing an orphaned directory reports a removal");
+        assertFalse(Files.exists(orphan), "The orphaned directory is deleted");
+        assertTrue(Files.exists(cacheTempDir), "The cache root survives");
+    }
+
+    @Test
+    void removeByKey_refusesKeysThatLeaveTheCacheRoot() throws Exception {
+        LocalRepositoryCache cache = new LocalRepositoryCache(cacheTempDir.resolve("mirrors"), false);
+        Files.createDirectories(cacheTempDir.resolve("mirrors"));
+        Path outside = cacheTempDir.resolve("outside");
+        Files.createDirectories(outside);
+        Files.writeString(outside.resolve("keep"), "x");
+
+        assertFalse(cache.removeByKey(".."), "The parent directory is not a cache key");
+        assertFalse(cache.removeByKey("../outside"), "A path with a separator is not a cache key");
+        assertFalse(cache.removeByKey("."), "The cache root itself is not a cache key");
+        assertFalse(cache.removeByKey(""), "An empty key is not a cache key");
+        assertFalse(cache.removeByKey(null), "A null key is not a cache key");
+        assertTrue(Files.exists(outside.resolve("keep")), "Nothing outside the cache root is touched");
+        assertTrue(Files.exists(cacheTempDir.resolve("mirrors")), "The cache root is not touched");
+    }
+
+    /**
+     * A removal issued while the first clone of the same repository is still writing its directory waits for the clone
+     * to finish, instead of deleting a half-written directory out from under it.
+     */
+    @Test
+    void removeByKey_waitsForAnInFlightCloneOfTheSameRepository() throws Exception {
+        LocalRepositoryCache cache = new LocalRepositoryCache(cacheTempDir, 0, false);
+        String key = cache.getCacheKey(remoteUrl);
+        var cloneStarted = new CountDownLatch(1);
+        var releaseClone = new CountDownLatch(1);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<Repository> clone = pool.submit(() -> cache.getOrClone(
+                    remoteUrl,
+                    null,
+                    transport -> {
+                        cloneStarted.countDown();
+                        try {
+                            releaseClone.await(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    },
+                    "alice"));
+            assertTrue(cloneStarted.await(10, TimeUnit.SECONDS), "The clone reached the transport");
+            assertTrue(Files.exists(cacheTempDir.resolve(key)), "The clone has created its directory");
+
+            Future<Boolean> removal = pool.submit(() -> cache.removeByKey(key));
+            Thread.sleep(300);
+            assertFalse(removal.isDone(), "The removal waits while the clone is in progress");
+
+            releaseClone.countDown();
+            clone.get(10, TimeUnit.SECONDS).close();
+            assertTrue(removal.get(10, TimeUnit.SECONDS), "The removal runs once the clone finishes");
+            assertNull(cache.getCached(remoteUrl), "The removed mirror is no longer served");
+            assertFalse(Files.exists(cacheTempDir.resolve(key)), "The mirror directory is gone");
+
+            Repository again = cache.getOrClone(remoteUrl);
+            try {
+                assertNotNull(again.resolve("HEAD"), "The repository can be cloned again after the removal");
+            } finally {
+                again.close();
+            }
+        } finally {
+            releaseClone.countDown();
             pool.shutdownNow();
         }
     }
